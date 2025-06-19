@@ -3,11 +3,16 @@ import usb.core
 import usb.util
 import sys
 import argparse
+import os
+import datetime
 
 # Жестко заданные Vendor ID и Product ID принтера
 # (Пример: HP LaserJet P1007/P1008, но убедитесь, что это ваш принтер)
 PRINTER_VENDOR_ID = 0x03f0
 PRINTER_PRODUCT_ID = 0x4117
+
+# Папка для сохранения заданий на печать
+JOBS_FOLDER = "jobs"
 
 def print_raw_to_usb(data):
     """
@@ -89,6 +94,16 @@ def start_print_server(port):
     host = '0.0.0.0'
     buffer_size = 4096
 
+    # Создаем папку для заданий, если ее нет
+    if not os.path.exists(JOBS_FOLDER):
+        try:
+            os.makedirs(JOBS_FOLDER)
+            print(f"Создана папка для сохранения заданий: '{JOBS_FOLDER}'")
+        except OSError as e:
+            print(f"Ошибка при создании папки '{JOBS_FOLDER}': {e}")
+            print("Пожалуйста, создайте ее вручную или проверьте права доступа.")
+            sys.exit(1) # Выходим, если не можем создать папку
+
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
@@ -98,9 +113,14 @@ def start_print_server(port):
         print(f"Сервер запущен и слушает порт {port}...")
         print(f"Ожидание заданий на печать для принтера с Vendor ID: {hex(PRINTER_VENDOR_ID)}, Product ID: {hex(PRINTER_PRODUCT_ID)}")
 
+        job_counter = 0 # Счетчик заданий для уникальных имен файлов
+
         while True:
             conn, addr = s.accept()
-            print(f"Получено новое соединение от {addr}")
+            job_counter += 1
+            print(f"\n--- Получено новое задание ({job_counter}) ---")
+            print(f"  Источник: {addr[0]}:{addr[1]}") # IP-адрес и порт клиента
+
             with conn:
                 full_data = b""
                 while True:
@@ -108,11 +128,24 @@ def start_print_server(port):
                     if not data:
                         break
                     full_data += data
-                print(f"Получено {len(full_data)} байт данных для печати.")
+
+                print(f"  Размер задания: {len(full_data)} байт.")
+
                 if full_data:
+                    # Сохранение задания в файл
+                    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                    filename = os.path.join(JOBS_FOLDER, f"job_{timestamp}_{addr[0].replace('.', '-')}_{job_counter}.prn")
+                    try:
+                        with open(filename, "wb") as f:
+                            f.write(full_data)
+                        print(f"  Задание сохранено в файл: '{filename}'")
+                    except IOError as e:
+                        print(f"  Ошибка при сохранении задания в файл '{filename}': {e}")
+
+                    # Отправка задания на принтер
                     print_raw_to_usb(full_data)
                 else:
-                    print("Получены пустые данные. Ничего не отправлено на принтер.")
+                    print("  Получены пустые данные. Ничего не отправлено на принтер и не сохранено.")
 
     except OSError as e:
         print(f"Ошибка при запуске сервера: {e}")
@@ -139,6 +172,7 @@ if __name__ == "__main__":
         print("Для доступа к USB-устройствам могут потребоваться права root или членство в группе 'lp'/'usb'.")
         print(f"Если возникнут ошибки доступа, попробуйте запустить: 'sudo python3 {sys.argv[0]} ...'")
         print("Или добавьте пользователя в группу 'lp' (sudo usermod -a -G lp $USER) и перезагрузитесь.")
+        print(f"Также убедитесь, что у пользователя есть права на запись в папку '{JOBS_FOLDER}'.")
         print("---")
 
     start_print_server(args.port)
