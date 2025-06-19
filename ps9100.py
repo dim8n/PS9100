@@ -96,7 +96,7 @@ def print_raw_to_usb(data: bytes) -> bool:
 def start_print_server(port: int):
     """
     Запускает сервер, который слушает указанный порт, сохраняет задания
-    и отправляет их на USB-принтер.
+    и отправляет их на USB-принтер. Сервер продолжает работу при ошибках соединения.
     """
     host = '0.0.0.0' # Слушаем все доступные сетевые интерфейсы
     buffer_size = 4096 # Размер буфера для приема данных за один раз
@@ -121,51 +121,64 @@ def start_print_server(port: int):
         print(f"Сервер запущен и слушает порт {port}...")
         print(f"Ожидание заданий на печать для принтера с Vendor ID: {hex(PRINTER_VENDOR_ID)}, Product ID: {hex(PRINTER_PRODUCT_ID)}")
         print(f"Задания также будут сохраняться в папку '{JOBS_FOLDER}'.")
+        print("Сервер будет продолжать работу при ошибках соединения.")
 
         job_counter = 0 # Счетчик заданий для создания уникальных имен файлов
 
         while True:
-            conn, addr = s.accept() # Принимаем входящее соединение
-            job_counter += 1
-            print(f"\n--- Получено новое задание ({job_counter}) ---")
-            print(f"  Источник: {addr[0]}:{addr[1]}") # IP-адрес и порт клиента
+            try:
+                conn, addr = s.accept() # Принимаем входящее соединение
+                job_counter += 1
+                print(f"\n--- Получено новое задание ({job_counter}) ---")
+                print(f"  Источник: {addr[0]}:{addr[1]}") # IP-адрес и порт клиента
 
-            with conn: # Автоматическое закрытие соединения при выходе из блока
-                full_data = b""
-                # Читаем все данные из сокета, пока клиент не закроет соединение
-                while True:
-                    data = conn.recv(buffer_size)
-                    if not data: # Если данных больше нет (клиент закрыл соединение)
-                        break
-                    full_data += data
+                with conn: # Автоматическое закрытие соединения при выходе из блока
+                    full_data = b""
+                    # Читаем все данные из сокета, пока клиент не закроет соединение
+                    while True:
+                        data = conn.recv(buffer_size)
+                        if not data: # Если данных больше нет (клиент закрыл соединение)
+                            break
+                        full_data += data
 
-                print(f"  Размер задания: {len(full_data)} байт.")
+                    print(f"  Размер задания: {len(full_data)} байт.")
 
-                if full_data:
-                    # Сохраняем задание в файл
-                    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                    # Имя файла включает IP-адрес клиента и порядковый номер задания для уникальности
-                    filename = os.path.join(JOBS_FOLDER, f"job_{timestamp}_{addr[0].replace('.', '-')}_{job_counter}.prn")
-                    try:
-                        with open(filename, "wb") as f:
-                            f.write(full_data)
-                        print(f"  Задание успешно сохранено в файл: '{filename}'")
-                    except IOError as e:
-                        print(f"  Ошибка при сохранении задания в файл '{filename}': {e}")
+                    if full_data:
+                        # Сохраняем задание в файл
+                        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                        # Имя файла включает IP-адрес клиента и порядковый номер задания для уникальности
+                        filename = os.path.join(JOBS_FOLDER, f"job_{timestamp}_{addr[0].replace('.', '-')}_{job_counter}.prn")
+                        try:
+                            with open(filename, "wb") as f:
+                                f.write(full_data)
+                            print(f"  Задание успешно сохранено в файл: '{filename}'")
+                        except IOError as e:
+                            print(f"  Ошибка при сохранении задания в файл '{filename}': {e}")
 
-                    # Отправляем задание на принтер (снова включено)
-                    print_raw_to_usb(full_data)
+                        # Отправляем задание на принтер
+                        print_raw_to_usb(full_data)
+                    else:
+                        print("  Получены пустые данные. Ничего не отправлено на принтер и не сохранено.")
+            except OSError as e:
+                # Обработка ошибок, которые могут возникнуть при работе с сокетом
+                if e.errno == 104: # Connection reset by peer
+                    print(f"\nВнимание: Соединение с клиентом {addr[0]}:{addr[1]} было разорвано (Connection reset by peer).")
+                    print("Подсказка: Это часто происходит, если клиент закрывает соединение некорректно (например, 'netcat' без '-q 0').")
                 else:
-                    print("  Получены пустые данные. Ничего не отправлено на принтер и не сохранено.")
+                    print(f"\nНепредвиденная ошибка сокета при обработке соединения: {e}")
+                print("Сервер продолжает ожидать новые задания.")
+            except Exception as e:
+                # Обработка любых других непредвиденных ошибок при обработке задания
+                print(f"\nПроизошла непредвиденная ошибка при обработке задания: {e}")
+                print("Сервер продолжает ожидать новые задания.")
 
     except OSError as e:
-        print(f"Ошибка при запуске сервера: {e}")
+        # Эта часть обрабатывает ошибки, которые могут возникнуть при запуске сервера (например, занятый порт)
+        print(f"Критическая ошибка при запуске сервера: {e}")
         if e.errno == 98: # EADDRINUSE (Address already in use)
             print(f"Подсказка: Порт {port} уже занят другим приложением. Пожалуйста, выберите другой порт или освободите текущий.")
     except KeyboardInterrupt:
         print("\nСервер остановлен пользователем (Ctrl+C).")
-    except Exception as e:
-        print(f"Произошла непредвиденная ошибка сервера: {e}")
     finally:
         s.close()
         print("Сетевой сокет закрыт. Сервер завершил работу.")
@@ -174,7 +187,7 @@ if __name__ == "__main__":
     # Настройка парсера аргументов командной строки
     parser = argparse.ArgumentParser(
         description="Сервер для удаленной RAW-печати на USB-принтер под Linux (VID/PID жестко заданы).\n"
-                    "Задания также сохраняются в папку 'jobs'.",
+                    "Задания также сохраняются в папку 'jobs'. Сервер устойчив к ошибкам соединения.",
         formatter_class=argparse.RawTextHelpFormatter
     )
     parser.add_argument("-p", "--port", type=int, default=9100,
