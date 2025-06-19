@@ -1,12 +1,14 @@
 import socket
+import usb.core
+import usb.util
 import sys
 import argparse
 import os
 import datetime
 
-# --- Конфигурация принтера (теперь не используется для печати, но можно оставить для информации) ---
+# --- Конфигурация принтера ---
 # Жестко заданные Vendor ID и Product ID принтера.
-# Эти значения больше не используются для отправки на USB-порт.
+# Убедитесь, что это VID/PID именно вашего принтера.
 PRINTER_VENDOR_ID = 0x03f0
 PRINTER_PRODUCT_ID = 0x4117
 
@@ -15,20 +17,86 @@ PRINTER_PRODUCT_ID = 0x4117
 JOBS_FOLDER = "jobs"
 # --- Конец конфигурации ---
 
-# Функция print_raw_to_usb теперь не будет вызываться.
-# Закомментирована или удалена, чтобы избежать ошибок и упростить логику.
-# def print_raw_to_usb(data: bytes) -> bool:
-#     """
-#     Эта функция временно отключена и не будет отправлять данные на USB-принтер.
-#     """
-#     print("  (Функция отправки на USB-принтер временно отключена.)")
-#     return True # Возвращаем True, чтобы не прерывать процесс сохранения
+def print_raw_to_usb(data: bytes) -> bool:
+    """
+    Отправляет RAW-данные напрямую на USB-принтер с жестко заданными VID/PID.
+    Возвращает True в случае успеха, False при ошибке.
+    """
+    # Находим USB-устройство по Vendor ID и Product ID
+    dev = usb.core.find(idVendor=PRINTER_VENDOR_ID, idProduct=PRINTER_PRODUCT_ID)
+
+    if dev is None:
+        print(f"  Ошибка: Принтер с Vendor ID {hex(PRINTER_VENDOR_ID)} и Product ID {hex(PRINTER_PRODUCT_ID)} не найден.")
+        print("  Подсказка: Убедитесь, что принтер подключен, включен и его VID/PID совпадают с указанными в коде.")
+        print("  Также проверьте права доступа: возможно, потребуется запустить скрипт с 'sudo' или настроить правила 'udev'.")
+        return False
+
+    # Отсоединяем драйвер ядра от устройства, если он активен.
+    # Это необходимо, чтобы pyusb мог получить эксклюзивный контроль над устройством в Linux.
+    if sys.platform != "win32" and dev.is_kernel_driver_active(0):
+        try:
+            dev.detach_kernel_driver(0)
+            print("  Драйвер ядра отсоединен для прямого доступа.")
+        except usb.core.USBError as e:
+            print(f"  Не удалось отсоединить драйвер ядра: {e}")
+            print("  Подсказка: Возможно, другое приложение или драйвер удерживает контроль над принтером.")
+            usb.util.dispose_resources(dev)
+            return False
+
+    # Устанавливаем активную конфигурацию и сбрасываем устройство.
+    # Сброс часто помогает принтеру выйти из некорректного состояния.
+    try:
+        dev.set_configuration()
+        dev.reset()
+    except usb.core.USBError as e:
+        print(f"  Ошибка установки конфигурации/сброса USB-устройства: {e}")
+        usb.util.dispose_resources(dev)
+        return False
+
+    # Находим конечную точку для вывода (OUT endpoint).
+    # Это канал, через который данные будут отправляться на принтер.
+    cfg = dev.get_active_configuration()
+    intf = cfg[(0,0)] # Обычно это первый интерфейс (индекс 0, альтернативная настройка 0)
+    ep = usb.util.find_descriptor(
+        intf,
+        custom_match = \
+        lambda e: \
+            usb.util.endpoint_direction(e.bEndpointAddress) == \
+            usb.util.ENDPOINT_OUT)
+
+    if ep is None:
+        print("  Ошибка: Не найдена конечная точка для вывода (OUT endpoint) на принтере.")
+        print("  Подсказка: Убедитесь, что это принтер, поддерживающий RAW-печать через USB.")
+        usb.util.dispose_resources(dev)
+        return False
+
+    print(f"  Отправка {len(data)} байт данных на принтер...")
+    try:
+        # Отправляем данные на принтер с таймаутом в 1 секунду.
+        ep.write(data, 1000)
+        print("  Данные успешно отправлены.")
+        return True
+    except usb.core.USBError as e:
+        print(f"  Ошибка при записи данных на принтер: {e}")
+        print("  Подсказка: Принтер не отвечает, таймаут или проблемы с USB-соединением.")
+        return False
+    finally:
+        # Важно освободить ресурсы USB после использования, чтобы другие приложения
+        # или драйвер ядра могли снова получить доступ к устройству.
+        usb.util.dispose_resources(dev)
+        # Попытка присоединить драйвер ядра обратно, если он был отсоединен
+        if sys.platform != "win32" and not dev.is_kernel_driver_active(0):
+            try:
+                dev.attach_kernel_driver(0)
+                print("  Драйвер ядра присоединен обратно.")
+            except usb.core.USBError as e:
+                print(f"  Не удалось присоединить драйвер ядра обратно: {e}")
 
 
 def start_print_server(port: int):
     """
-    Запускает сервер, который слушает указанный порт и сохраняет
-    полученные задания на печать в папку.
+    Запускает сервер, который слушает указанный порт, сохраняет задания
+    и отправляет их на USB-принтер.
     """
     host = '0.0.0.0' # Слушаем все доступные сетевые интерфейсы
     buffer_size = 4096 # Размер буфера для приема данных за один раз
@@ -51,7 +119,8 @@ def start_print_server(port: int):
         s.bind((host, port))
         s.listen(1) # Сервер будет принимать одно входящее соединение за раз
         print(f"Сервер запущен и слушает порт {port}...")
-        print(f"Задания будут сохраняться в папку '{JOBS_FOLDER}'. Отправка на USB-принтер ОТКЛЮЧЕНА.")
+        print(f"Ожидание заданий на печать для принтера с Vendor ID: {hex(PRINTER_VENDOR_ID)}, Product ID: {hex(PRINTER_PRODUCT_ID)}")
+        print(f"Задания также будут сохраняться в папку '{JOBS_FOLDER}'.")
 
         job_counter = 0 # Счетчик заданий для создания уникальных имен файлов
 
@@ -83,11 +152,11 @@ def start_print_server(port: int):
                         print(f"  Задание успешно сохранено в файл: '{filename}'")
                     except IOError as e:
                         print(f"  Ошибка при сохранении задания в файл '{filename}': {e}")
-                    
-                    # Отправка задания на принтер ВРЕМЕННО ОТКЛЮЧЕНА
-                    print("  Отправка задания на USB-принтер пропущена (функция отключена).")
+
+                    # Отправляем задание на принтер (снова включено)
+                    print_raw_to_usb(full_data)
                 else:
-                    print("  Получены пустые данные. Ничего не сохранено.")
+                    print("  Получены пустые данные. Ничего не отправлено на принтер и не сохранено.")
 
     except OSError as e:
         print(f"Ошибка при запуске сервера: {e}")
@@ -104,7 +173,8 @@ def start_print_server(port: int):
 if __name__ == "__main__":
     # Настройка парсера аргументов командной строки
     parser = argparse.ArgumentParser(
-        description="Сервер для сохранения RAW-заданий на печать в файл (отправка на USB-принтер отключена).",
+        description="Сервер для удаленной RAW-печати на USB-принтер под Linux (VID/PID жестко заданы).\n"
+                    "Задания также сохраняются в папку 'jobs'.",
         formatter_class=argparse.RawTextHelpFormatter
     )
     parser.add_argument("-p", "--port", type=int, default=9100,
@@ -114,9 +184,13 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # --- Важное предупреждение для Linux ---
-    if sys.platform != "win32":
+    if sys.platform != "win32": # Это предупреждение актуально только для Linux/macOS
         print("\n--- ВАЖНО для Linux ---")
-        print(f"Убедитесь, что у пользователя, запускающего скрипт, есть права на запись в папку '{JOBS_FOLDER}' (в текущем каталоге).")
+        print("Для доступа к USB-устройствам могут потребоваться права root или членство в группе 'lp'/'usb'.")
+        print(f"Если возникнут ошибки доступа (например, 'Access denied'), попробуйте запустить:")
+        print(f"  sudo python3 {sys.argv[0]} ...")
+        print("Или добавьте пользователя в группу 'lp' (sudo usermod -a -G lp $USER) и ПЕРЕЗАГРУЗИТЕ систему.")
+        print(f"Также убедитесь, что у пользователя есть права на запись в папку '{JOBS_FOLDER}' (в текущем каталоге).")
         print("---")
     # --- Конец предупреждения ---
 
